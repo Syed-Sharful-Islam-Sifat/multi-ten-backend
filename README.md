@@ -2,6 +2,8 @@
 
 > A production-grade, multi-tenant SaaS notes platform built for companies to manage workspaces, collaborate on notes, and publish content publicly.
 
+I have decided to explain the system design rather than implementing it in this short period of time as implementing this kind of system need times. I have tried to elaborate my thought process and documented it.
+
 ---
 
 ## 📑 Table of Contents
