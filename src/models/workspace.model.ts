@@ -1,6 +1,4 @@
-// ============================================================
-// models/Workspace.ts
-// ============================================================
+
 import mongoose, { Document, Schema, Types } from 'mongoose';
 
 export interface IWorkspace extends Document {

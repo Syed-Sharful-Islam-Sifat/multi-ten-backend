@@ -1,17 +1,4 @@
-// ============================================================
-// models/NoteVote.ts
-//
-// One vote per company per public note.
-// Compound unique index enforced at DB level — not just app level.
-//
-// On every vote write, also run atomically:
-//   await Note.updateOne({ _id: noteId }, { $inc: { votesCache: delta } })
-//
-// Delta logic:
-//   New vote:     delta = value                    (+1 or -1)
-//   Changed vote: delta = newValue - oldValue      (+1→-1 = -2)
-//   Removed vote: delta = -oldValue
-// ============================================================
+
 import mongoose, { Document, Schema, Types } from 'mongoose';
 
 export interface INoteVote extends Document {

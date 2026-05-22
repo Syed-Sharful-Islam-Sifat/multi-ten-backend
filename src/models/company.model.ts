@@ -1,6 +1,4 @@
-// ============================================================
-// models/Company.ts
-// ============================================================
+
 import mongoose, { Document, Schema } from 'mongoose';
 
 export interface ICompany extends Document {

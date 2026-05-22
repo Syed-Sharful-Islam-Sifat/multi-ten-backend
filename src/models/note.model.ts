@@ -1,34 +1,4 @@
-// ============================================================
-// models/Note.ts
-//
-// Two independent axes drive visibility:
-//
-//   noteType : 'private' | 'public'
-//     private → only company members can see it
-//     public  → streams into global public directory once published
-//
-//   isDraft : true | false
-//     true  → hidden from all listings (author only)
-//     false → visible according to noteType rules
-//
-// Visibility matrix:
-//   private + isDraft:true  → author only
-//   private + isDraft:false → all company members
-//   public  + isDraft:true  → author only (never in public directory)
-//   public  + isDraft:false → global public directory
-//
-// companyId denormalized from workspace:
-//   Every tenant isolation check hits notes directly — no $lookup.
-//
-// votesCache:
-//   Denormalized SUM of noteVotes.value.
-//   Updated atomically via $inc on every vote write.
-//   Avoids aggregation pipeline on public listing pages.
-//
-// publishedAt:
-//   Set ONCE on first publish — never updated again.
-//   Prevents gaming "sort by new" via trivial edits.
-// ============================================================
+
 import mongoose, { Document, Schema, Types } from 'mongoose';
 
 export interface INote extends Document {
