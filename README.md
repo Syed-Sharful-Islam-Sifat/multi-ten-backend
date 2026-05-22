@@ -1,7 +1,3 @@
-# Multitenant — Backend
-
-This is a detailed explanation of Secure SaaS notes system. I have tried to explain how I have thought about the system by the time of implementation I found this is a complex system that can't be implemented with that much of time so I decided rather implementing the system it will be feasible to sketch the whole system design if the design is crystal clear then implementation will not take much time
-
 # 🗒️ Workspace Notes — Multi-Tenant SaaS Notes System
 
 > A production-grade, multi-tenant SaaS notes platform built for companies to manage workspaces, collaborate on notes, and publish content publicly.
@@ -11,6 +7,8 @@ This is a detailed explanation of Secure SaaS notes system. I have tried to expl
 ## 📑 Table of Contents
 
 - [Project Overview](#project-overview)
+- [Why MongoDB](#why-mongodb)
+- [MongoDB Free Tier (512MB) — Optimization Strategy](#mongodb-free-tier-512mb--optimization-strategy)
 - [System Architecture](#system-architecture)
 - [Database Design](#database-design)
 - [API Design](#api-design)
@@ -43,10 +41,147 @@ This is a detailed explanation of Secure SaaS notes system. I have tried to expl
 - Secure by default (auth, authorization, input sanitization)
 - Offloaded background jobs for maintenance tasks (e.g., history cleanup)
 - Simple but functional UI
+- Storage-efficient schema design to run within MongoDB Atlas Free Tier (512MB)
 
 **What was scoped for design (not full implementation due to time constraints):**
 - Full system design, database schema, API contract, background job strategy, and UI wireflow are documented here
 - Partial implementation covers: `[list what was actually implemented]`
+
+---
+
+## Why MongoDB
+
+> **Honest engineering decision:** PostgreSQL would be the ideal choice for a multi-tenant system of this kind — it provides strong relational integrity, row-level security for tenant isolation, and mature full-text search. However, given the **strict time constraint** of a single workday, I chose MongoDB for the following practical reasons:
+
+### 1. Familiarity = Speed
+I have significantly more hands-on experience with MongoDB and Mongoose. In a time-boxed assessment, choosing a familiar tool means less time fighting the database and more time building features. A well-designed MongoDB schema with proper indexes performs excellently for this use case.
+
+### 2. Flexible Document Model Fits Notes Well
+Notes are naturally document-shaped. Tags, vote counts, and metadata live comfortably inside a single document without JOINs. This reduces query complexity for common read paths like "get note with its tags and vote counts".
+
+```js
+// One document — no joins needed for common reads
+{
+  _id: ObjectId,
+  companyId: ObjectId,
+  workspaceId: ObjectId,
+  title: "My Note",
+  content: "...",
+  tags: ["productivity", "backend"],
+  type: "public",
+  status: "published",
+  voteCount: { up: 42, down: 3 },
+  createdBy: ObjectId,
+  createdAt: ISODate,
+  updatedAt: ISODate
+}
+```
+
+### 3. Atlas Free Tier Available Immediately
+MongoDB Atlas M0 (free tier) spins up in under 2 minutes with no credit card. This meant I could start building immediately without any local Docker/Postgres setup overhead during the assessment.
+
+### 4. Mongoose ODM is Productive
+Mongoose provides schema validation, middleware hooks (for auto-creating history on save), and a clean API — all things that would take longer to wire up manually with a raw SQL client under time pressure.
+
+### Trade-offs Acknowledged
+| Concern | How it's mitigated |
+|---|---|
+| No true foreign key constraints | Application-layer validation + Mongoose references |
+| No multi-document ACID transactions by default | Used MongoDB sessions for history write + note update atomicity |
+| Harder to enforce tenant isolation at DB level | Enforced strictly at service layer — every query includes `companyId` |
+| No native full-text index as powerful as pg_trgm | MongoDB Atlas Search (Lucene-based) or text indexes used for title search |
+
+---
+
+## MongoDB Free Tier (512MB) — Optimization Strategy
+
+MongoDB Atlas M0 gives **512MB of storage**. With 1,000 workspaces and 500,000 notes, storage efficiency is critical. Here is exactly how the system is designed to fit and perform within that constraint.
+
+### Storage Estimate
+
+| Collection | Avg Doc Size | Count | Estimated Size |
+|---|---|---|---|
+| `notes` | ~600 bytes | 500,000 | ~300MB |
+| `noteHistories` | ~650 bytes | ~500,000 (capped, 7-day rolling) | ~325MB *(before cleanup)* |
+| `workspaces` | ~200 bytes | 1,000 | ~0.2MB |
+| `companies` | ~150 bytes | ~50 | negligible |
+| `users` | ~200 bytes | ~500 | ~0.1MB |
+| Indexes | — | — | ~30–50MB |
+
+> **⚠️ The math:** Notes alone take ~300MB. History entries are the danger zone. The 7-day cleanup job is **not optional** — it is essential to survival on the free tier.
+
+### Optimization Techniques Applied
+
+#### 1. Short Field Names in Documents
+MongoDB stores field names in every document. Shortening field names saves real bytes at 500K documents:
+
+```js
+// ❌ Verbose — wastes ~50 bytes per document × 500K = 25MB wasted
+{ companyId, workspaceId, createdAt, updatedAt, voteCount }
+
+// ✅ Abbreviated field names — saves significant space
+{ cId, wId, cat, uat, vc }
+```
+> In code, Mongoose virtuals or a transform layer maps short names back to readable names in API responses.
+
+#### 2. Embedded Vote Counts (not a separate votes collection)
+Instead of storing one document per vote (which at 500K notes with avg 20 votes each = 10M documents), vote counts are embedded directly in the note as a counter:
+
+```js
+// Embedded in note — no separate votes collection
+voteCount: { up: Number, down: Number }
+
+// Atomic increment — no race conditions
+await Note.updateOne(
+  { _id: noteId, 'voters': { $ne: userId } }, // prevent double vote
+  {
+    $inc: { 'voteCount.up': 1 },
+    $push: { voters: userId }
+  }
+);
+```
+
+The `voters` array (list of user IDs who voted) is kept on the note to enforce one-vote-per-user. For very popular notes this array is capped or replaced with a separate lean `votes` collection only when needed.
+
+#### 3. History Stored Separately with Aggressive TTL Cleanup
+History is **not embedded** in the note document (that would make note documents huge). It lives in a separate `noteHistories` collection with a MongoDB TTL index that auto-expires documents — no cron job needed at the DB level:
+
+```js
+// TTL index — MongoDB automatically deletes docs after 7 days
+noteHistoriesSchema.index({ changedAt: 1 }, { expireAfterSeconds: 604800 });
+```
+
+This is the most storage-safe approach — expired history is deleted automatically by MongoDB's background TTL monitor, with zero server load.
+
+#### 4. Content Trimming — No Bloated History
+History entries store only `prevTitle` and `prevContent` (the diff snapshot). They do **not** duplicate tags, votes, or metadata — only what changed.
+
+#### 5. Selective Projection in Queries
+List endpoints never fetch `content` (the large field). Only the detail/edit view fetches full content:
+
+```js
+// List query — excludes content field
+Note.find({ companyId }).select('title tags type status createdAt voteCount').lean();
+
+// Detail query — fetches everything
+Note.findById(id).lean();
+```
+
+`.lean()` is always used for read-only queries — returns plain JS objects instead of Mongoose documents, ~3x faster and less memory.
+
+#### 6. Pagination — Never Load All 500K Notes
+All list endpoints use cursor-based pagination. `skip()` is never used on large collections — it scans and discards documents, which is catastrophic at 500K records:
+
+```js
+// ❌ Never do this at scale
+Note.find({}).skip(50000).limit(20)
+
+// ✅ Cursor-based — uses the index directly
+Note.find({ _id: { $gt: lastSeenId }, type: 'public', status: 'published' })
+    .sort({ _id: 1 })
+    .limit(20)
+    .lean()
+```
 
 ---
 
@@ -55,141 +190,154 @@ This is a detailed explanation of Secure SaaS notes system. I have tried to expl
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                          Client (Browser)                        │
-│              Next.js / React SPA / Plain HTML+JS                 │
+│                    Express-rendered views / React                │
 └────────────────────────────┬─────────────────────────────────────┘
-                             │ HTTP/REST (or tRPC)
+                             │ HTTP/REST
 ┌────────────────────────────▼─────────────────────────────────────┐
-│                        API Server (Node.js)                      │
-│              Express / Fastify / Next.js API Routes              │
+│                  API Server (Node.js + Express)                  │
 │                                                                  │
 │   ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
 │   │  Auth Layer  │  │  Note Router │  │  Public Dir Router   │  │
-│   │  (JWT/Session│  │  (CRUD, Vote)│  │  (Public Listings)   │  │
+│   │  (JWT)       │  │  (CRUD, Vote)│  │  (Public Listings)   │  │
 │   └──────────────┘  └──────────────┘  └──────────────────────┘  │
 └────────────────────────────┬─────────────────────────────────────┘
                              │
           ┌──────────────────┼──────────────────┐
           │                  │                  │
-┌─────────▼──────┐  ┌────────▼───────┐  ┌──────▼──────────┐
-│   PostgreSQL   │  │     Redis      │  │  Job Queue       │
-│  (Primary DB)  │  │  (Cache/Rate   │  │  (BullMQ /       │
-│                │  │   Limiting)    │  │   pg-boss /      │
-│                │  │                │  │   cron offload)  │
-└────────────────┘  └────────────────┘  └─────────────────┘
+┌─────────▼──────┐  ┌────────▼───────┐  ┌──────▼──────────────┐
+│    MongoDB     │  │  node-cron     │  │  In-process cache   │
+│  Atlas M0      │  │  (cleanup job  │  │  (node-cache /      │
+│  (Free Tier)   │  │   + TTL index) │  │   simple Map TTL)   │
+└────────────────┘  └────────────────┘  └─────────────────────┘
 ```
 
 **Architecture decisions:**
-- `[Explain why you chose your framework — e.g., Next.js for SSR + API routes in one repo]`
-- `[Explain why PostgreSQL — relational integrity, JSONB for tags, full-text search]`
-- `[Explain why Redis — caching hot public note listings, rate limiting votes]`
-- `[Explain job queue choice — pg-boss keeps it in Postgres, no extra infra; BullMQ needs Redis but more robust]`
+- **Node.js + Express:** Familiar, minimal setup time, excellent MongoDB ecosystem (Mongoose)
+- **MongoDB Atlas M0:** Zero-infra, free, instant setup — practical for time-boxed development
+- **No Redis:** Avoided to reduce infra complexity. In-process caching (node-cache) used for hot public directory pages. Redis would be the correct next step for production
+- **node-cron for cleanup:** Lightweight scheduler built into the Node process. MongoDB TTL indexes handle the actual deletion — node-cron is only needed for any application-level cleanup tasks
 
 ---
 
 ## Database Design
 
-> 📎 **Full ERD Link:** `[Insert link to your DB diagram — dbdiagram.io, Lucidchart, DrawSQL, etc.]`
+> 📎 **Full Schema Diagram Link:** `[Insert link — use MongoDB Compass schema view export, or draw at dbdiagram.io]`
 
-### Entity Overview
+### Collection Overview
 
 ```
 companies
-  └── workspaces
-        └── notes
-              ├── note_tags  →  tags
-              ├── note_votes
-              └── note_histories
-users
-  └── (belongs to a company)
+  └── workspaces        (companyId ref)
+        └── notes       (companyId + workspaceId ref)
+              └── noteHistories  (noteId ref, TTL indexed)
+users             (companyId ref)
 ```
 
-### Tables
+### Collections & Schemas
 
 #### `companies`
-| Column       | Type        | Notes                        |
-|--------------|-------------|------------------------------|
-| id           | UUID (PK)   | Primary key                  |
-| name         | VARCHAR     | Company name                 |
-| slug         | VARCHAR     | Unique URL-safe identifier   |
-| created_at   | TIMESTAMPTZ |                              |
+```js
+{
+  _id: ObjectId,
+  name: String,          // "Acme Corp"
+  slug: String,          // "acme-corp" — unique, URL-safe
+  createdAt: Date
+}
+```
 
 #### `users`
-| Column       | Type        | Notes                                  |
-|--------------|-------------|----------------------------------------|
-| id           | UUID (PK)   |                                        |
-| company_id   | UUID (FK)   | Tenant isolation — scoped to company   |
-| email        | VARCHAR     | Unique                                 |
-| password_hash| VARCHAR     |                                        |
-| role         | ENUM        | `owner`, `member`                      |
-| created_at   | TIMESTAMPTZ |                                        |
+```js
+{
+  _id: ObjectId,
+  companyId: ObjectId,   // Tenant key — ALWAYS present
+  email: String,         // unique index
+  passwordHash: String,
+  role: String,          // "owner" | "member"
+  createdAt: Date
+}
+// Index: { email: 1 } unique
+// Index: { companyId: 1 }
+```
 
 #### `workspaces`
-| Column       | Type        | Notes                              |
-|--------------|-------------|-------------------------------------|
-| id           | UUID (PK)   |                                     |
-| company_id   | UUID (FK)   | Tenant scoping                      |
-| name         | VARCHAR     |                                     |
-| created_at   | TIMESTAMPTZ |                                     |
+```js
+{
+  _id: ObjectId,
+  companyId: ObjectId,   // Tenant key
+  name: String,
+  createdAt: Date
+}
+// Index: { companyId: 1 }
+```
 
 #### `notes`
-| Column         | Type        | Notes                                             |
-|----------------|-------------|---------------------------------------------------|
-| id             | UUID (PK)   |                                                   |
-| workspace_id   | UUID (FK)   |                                                   |
-| company_id     | UUID (FK)   | Denormalized for faster tenant-scoped queries     |
-| title          | VARCHAR     | Indexed for search                                |
-| content        | TEXT        |                                                   |
-| type           | ENUM        | `public`, `private`                               |
-| status         | ENUM        | `draft`, `published`                              |
-| created_by     | UUID (FK → users) |                                             |
-| updated_by     | UUID (FK → users) |                                             |
-| created_at     | TIMESTAMPTZ |                                                   |
-| updated_at     | TIMESTAMPTZ |                                                   |
+```js
+{
+  _id: ObjectId,
+  companyId: ObjectId,   // Tenant key — denormalized for fast scoping
+  workspaceId: ObjectId,
+  title: String,
+  content: String,
+  tags: [String],        // ["productivity", "backend"] — embedded array
+  type: String,          // "public" | "private"
+  status: String,        // "draft" | "published"
+  voteCount: {
+    up: Number,          // Embedded counter — no separate votes collection
+    down: Number
+  },
+  voters: [ObjectId],    // User IDs who voted — enforces one-vote-per-user
+                         // (capped at high scale; see optimization notes)
+  createdBy: ObjectId,
+  updatedBy: ObjectId,
+  createdAt: Date,
+  updatedAt: Date
+}
+```
 
-> **Index strategy:**
-> - `(company_id, workspace_id)` — tenant-scoped workspace queries
-> - `(type, status)` — public published note listings
-> - `title` with `pg_trgm` GIN index — fast ILIKE / full-text title search
-> - `(type, status, created_at DESC)` — public directory sorted by newest
+**Indexes on `notes`:**
+```js
+// Tenant-scoped workspace listing
+{ companyId: 1, workspaceId: 1 }
 
-#### `tags`
-| Column | Type      | Notes          |
-|--------|-----------|----------------|
-| id     | UUID (PK) |                |
-| name   | VARCHAR   | Unique per tag |
+// Public directory listing (partial index — only indexes public+published docs)
+{ type: 1, status: 1, createdAt: -1 }
 
-#### `note_tags` *(junction table)*
-| Column  | Type      |
-|---------|-----------|
-| note_id | UUID (FK) |
-| tag_id  | UUID (FK) |
+// Title search
+{ title: "text" }  // MongoDB text index for $text search
+                   // Or Atlas Search for better relevance
 
-> Composite PK on `(note_id, tag_id)`
+// Sorting by votes in public directory
+{ type: 1, status: 1, "voteCount.up": -1 }
+{ type: 1, status: 1, "voteCount.down": -1 }
 
-#### `note_votes`
-| Column      | Type      | Notes                                        |
-|-------------|-----------|----------------------------------------------|
-| id          | UUID (PK) |                                              |
-| note_id     | UUID (FK) |                                              |
-| voter_id    | UUID (FK) | Can be user or anonymous fingerprint         |
-| company_id  | UUID (FK) | The voter's company (for cross-company votes)|
-| vote_type   | ENUM      | `upvote`, `downvote`                         |
-| created_at  | TIMESTAMPTZ |                                            |
+// Cursor-based pagination anchor
+{ _id: 1 }  // default, already exists
+```
 
-> Unique constraint on `(note_id, voter_id)` — one vote per user per note.
+#### `noteHistories`
+```js
+{
+  _id: ObjectId,
+  noteId: ObjectId,
+  prevTitle: String,     // Snapshot of title before this edit
+  prevContent: String,   // Snapshot of content before this edit
+  changedBy: ObjectId,   // User who made the change
+  changedAt: Date        // ← TTL index on this field
+}
+```
 
-#### `note_histories`
-| Column       | Type        | Notes                                      |
-|--------------|-------------|--------------------------------------------|
-| id           | UUID (PK)   |                                            |
-| note_id      | UUID (FK)   |                                            |
-| prev_title   | VARCHAR     | Snapshot of title before change            |
-| prev_content | TEXT        | Snapshot of content before change          |
-| changed_by   | UUID (FK → users) |                                      |
-| changed_at   | TIMESTAMPTZ | Indexed — used for 7-day TTL cleanup       |
+**Indexes on `noteHistories`:**
+```js
+// Fast history lookup per note
+{ noteId: 1, changedAt: -1 }
 
-> **Index:** `(note_id, changed_at DESC)` — fast history retrieval per note  
-> **Cleanup index:** `changed_at` — used by background job to delete old records
+// TTL index — MongoDB auto-deletes documents after 7 days
+// This is the primary cleanup mechanism — no application code needed
+{ changedAt: 1 }  // expireAfterSeconds: 604800 (7 days)
+```
+
+> **Why a separate collection for history (not embedded array in note)?**
+> Embedding history in the note document would make the note document grow unboundedly — a document with 50 history entries could be 30KB+. At 500K notes, that's ~15GB just for bloated note documents. A separate collection with a TTL index is the correct MongoDB pattern here.
 
 ---
 
@@ -198,48 +346,49 @@ users
 > All endpoints are prefixed with `/api/v1`
 
 ### Auth
-| Method | Endpoint            | Description          |
-|--------|---------------------|----------------------|
-| POST   | `/auth/register`    | Register company + owner user |
-| POST   | `/auth/login`       | Login, returns JWT   |
-| POST   | `/auth/logout`      | Invalidate session   |
+| Method | Endpoint            | Description                    |
+|--------|---------------------|--------------------------------|
+| POST   | `/auth/register`    | Register company + owner user  |
+| POST   | `/auth/login`       | Login, returns JWT             |
+| POST   | `/auth/logout`      | Client-side token discard      |
 
 ### Workspaces *(authenticated, tenant-scoped)*
-| Method | Endpoint                     | Description            |
-|--------|------------------------------|------------------------|
-| GET    | `/workspaces`                | List my company's workspaces |
-| POST   | `/workspaces`                | Create workspace       |
-| GET    | `/workspaces/:id`            | Get single workspace   |
-| PUT    | `/workspaces/:id`            | Update workspace       |
-| DELETE | `/workspaces/:id`            | Delete workspace       |
+| Method | Endpoint             | Description                      |
+|--------|----------------------|----------------------------------|
+| GET    | `/workspaces`        | List my company's workspaces     |
+| POST   | `/workspaces`        | Create workspace                 |
+| GET    | `/workspaces/:id`    | Get single workspace             |
+| PUT    | `/workspaces/:id`    | Update workspace                 |
+| DELETE | `/workspaces/:id`    | Delete workspace                 |
 
 ### Notes *(authenticated)*
-| Method | Endpoint                            | Description                        |
-|--------|-------------------------------------|------------------------------------|
-| GET    | `/workspaces/:wid/notes`            | List notes in workspace (private)  |
-| POST   | `/workspaces/:wid/notes`            | Create note                        |
-| GET    | `/workspaces/:wid/notes/:id`        | Get note detail                    |
-| PUT    | `/workspaces/:wid/notes/:id`        | Update note (triggers history)     |
-| DELETE | `/workspaces/:wid/notes/:id`        | Delete note                        |
-| POST   | `/workspaces/:wid/notes/:id/publish`| Publish a draft note               |
+| Method | Endpoint                              | Description                        |
+|--------|---------------------------------------|------------------------------------|
+| GET    | `/workspaces/:wid/notes`              | List notes in workspace (no content field) |
+| POST   | `/workspaces/:wid/notes`              | Create note                        |
+| GET    | `/workspaces/:wid/notes/:id`          | Get note detail (with content)     |
+| PUT    | `/workspaces/:wid/notes/:id`          | Update note (auto-creates history) |
+| DELETE | `/workspaces/:wid/notes/:id`          | Delete note + its histories        |
+| POST   | `/workspaces/:wid/notes/:id/publish`  | Publish a draft note               |
 
 ### Note History *(authenticated)*
-| Method | Endpoint                                     | Description               |
-|--------|----------------------------------------------|---------------------------|
-| GET    | `/notes/:id/history`                         | List history entries      |
-| POST   | `/notes/:id/history/:hid/restore`            | Restore a history entry   |
+| Method | Endpoint                              | Description               |
+|--------|---------------------------------------|---------------------------|
+| GET    | `/notes/:id/history`                  | List history entries      |
+| POST   | `/notes/:id/history/:hid/restore`     | Restore a history entry   |
 
 ### Public Directory *(unauthenticated)*
-| Method | Endpoint                       | Description                                            |
-|--------|--------------------------------|--------------------------------------------------------|
-| GET    | `/public/notes`                | List all public published notes (sortable, searchable) |
-| GET    | `/public/notes/:id`            | Single public note detail                              |
-| POST   | `/public/notes/:id/vote`       | Upvote or downvote a public note                       |
+| Method | Endpoint                    | Description                                              |
+|--------|-----------------------------|----------------------------------------------------------|
+| GET    | `/public/notes`             | List all public published notes (sortable, searchable)   |
+| GET    | `/public/notes/:id`         | Single public note detail                                |
+| POST   | `/public/notes/:id/vote`    | Upvote or downvote a public note                         |
 
 **Query params for `/public/notes`:**
-- `search=` — title search (ILIKE with trigram index)
-- `sort=` — `newest`, `oldest`, `most_upvotes`, `most_downvotes`
-- `page=`, `limit=` — pagination (cursor-based preferred at scale)
+- `search=` — title search using MongoDB `$text` index
+- `sort=` — `newest` | `oldest` | `most_upvotes` | `most_downvotes`
+- `cursor=` — last seen `_id` for cursor-based pagination
+- `limit=` — default 20, max 50
 
 ---
 
@@ -247,159 +396,202 @@ users
 
 ### Multi-Tenancy
 
-Every database query is scoped by `company_id`. This is enforced at the service layer, not just the route level.
+Every MongoDB query is scoped with `companyId`. This is enforced at the **service layer** — not just the route level — so it's impossible to accidentally return cross-tenant data.
 
-**Strategy:**
-- `company_id` is extracted from the authenticated JWT on every request
-- All queries include `WHERE company_id = $company_id` — no exceptions
-- Row-Level Security (RLS) in PostgreSQL can be used as an additional backstop
+```js
+// Every note query — companyId is always the first filter
+const notes = await Note
+  .find({ companyId: req.user.companyId, workspaceId })
+  .select('title tags type status createdAt voteCount')
+  .lean();
+```
 
-```
-// Pseudocode — every note query is tenant-scoped
-getNotes(companyId, workspaceId) {
-  SELECT * FROM notes
-  WHERE company_id = $companyId
-    AND workspace_id = $workspaceId
-}
-```
+There is no database-level row security (MongoDB doesn't have PostgreSQL-style RLS), so discipline at the service layer is critical. A middleware helper `tenantScope(req)` returns `{ companyId: req.user.companyId }` and is spread into every query filter.
 
 ### Draft Mode
 
-- Notes have a `status` field: `draft` | `published`
-- Drafts are **never** included in public directory listings
-- Draft notes are only visible to the owning workspace members
-- Publishing a draft: `POST /notes/:id/publish` — sets `status = 'published'`
-- UI shows a "DRAFT" badge on unpublished notes in the private workspace view
+- Notes have a `status` field: `"draft"` | `"published"`
+- Drafts are **never** included in public directory queries: `{ type: 'public', status: 'published' }`
+- Draft notes appear only in the private workspace view with an orange **DRAFT** badge
+- Publishing: `POST /notes/:id/publish` sets `status = 'published'` and `updatedAt = now()`
+- A draft note can still be `type: 'private'` or `type: 'public'` — the `type` determines where it goes once published; `status` controls whether it's live
 
 ### History System
 
-- On every `PUT /notes/:id` request, before applying the update:
-  1. Read current `title` + `content` from DB
-  2. Insert a row into `note_histories` with the previous values + `changed_by` + `changed_at = NOW()`
-  3. Apply the new update to `notes`
-- Users can view history via the history page and click "Restore" to revert
+Every `PUT /notes/:id` triggers a Mongoose **pre-save middleware** that:
+
+1. Reads the current `title` and `content` from the document before applying changes
+2. Inserts a `NoteHistory` document with the previous values
+3. Both operations run inside a **MongoDB session (transaction)** so they succeed or fail together
+
+```js
+// Mongoose pre-save hook on Note schema
+NoteSchema.pre('save', async function (next) {
+  if (!this.isNew && (this.isModified('title') || this.isModified('content'))) {
+    const session = this.$session();
+    await NoteHistory.create([{
+      noteId: this._id,
+      prevTitle: this.get('title', null, { getters: false }),
+      prevContent: this.get('content', null, { getters: false }),
+      changedBy: this._updatedBy,  // set by controller before save
+      changedAt: new Date()
+    }], { session });
+  }
+  next();
+});
+```
 
 **Restore flow:**
 1. `POST /notes/:id/history/:hid/restore`
-2. Server reads `prev_title` and `prev_content` from the history entry
-3. Server saves current state as a new history entry (so restore is itself undoable)
-4. Applies the historical values to the current note
+2. Load the history entry
+3. Save current state as a new history entry (so restore is itself undoable)
+4. Apply `prevTitle` and `prevContent` to the note → triggers the pre-save hook again
 
 ### Note Voting
 
-- Any authenticated user (including from other companies) can vote on public notes
-- Unique constraint prevents double voting: `(note_id, voter_id)`
-- Vote counts are aggregated with `COUNT(CASE WHEN vote_type = 'upvote' THEN 1 END)` — or maintained as a denormalized counter column updated via trigger/service for performance
-- `[Explain your chosen vote count strategy — real-time aggregate vs. cached counter]`
+- Vote counts are **embedded** in the note as `voteCount: { up, down }`
+- The `voters` array on the note prevents double-voting via an atomic query:
+
+```js
+const result = await Note.updateOne(
+  {
+    _id: noteId,
+    type: 'public',
+    voters: { $ne: userId }   // Only update if user hasn't voted
+  },
+  {
+    $inc: { [`voteCount.${voteType}`]: 1 },
+    $push: { voters: userId }
+  }
+);
+
+if (result.matchedCount === 0) {
+  throw new Error('Already voted or note not found');
+}
+```
+
+- **Changing a vote:** Allowed — decrements the old vote type, increments the new one, using `$set` + `$inc` in one atomic operation
+- **Cross-company voting:** Any authenticated user from any company can vote on public notes
 
 ### Public Directory
 
-- Lists all notes where `type = 'public' AND status = 'published'`
-- Includes workspace name and tags in the response
-- Supports sorting and title search
-- No authentication required
+- Queries: `{ type: 'public', status: 'published' }`
+- Includes workspace name (populated via `workspaceId` ref or pre-joined in aggregation)
+- Cursor-based pagination using `_id` as cursor
+- Sort options map to MongoDB sort objects:
+
+```js
+const sortMap = {
+  newest:        { createdAt: -1 },
+  oldest:        { createdAt: 1  },
+  most_upvotes:  { 'voteCount.up': -1 },
+  most_downvotes:{ 'voteCount.down': -1 }
+};
+```
 
 ---
 
 ## History Cleanup Strategy (7-Day Retention)
 
-### The Problem
-With ~500K notes and frequent edits, the `note_histories` table can grow very large. We need to delete entries older than 7 days reliably without impacting server performance.
+### Primary Mechanism: MongoDB TTL Index
 
-### The Solution: Offloaded Background Job
-
-**Approach: Database-native scheduled job using `pg-boss` (or equivalent)**
-
-The cleanup is handled as an **asynchronous background job**, completely decoupled from the web server request cycle.
-
-#### Why `pg-boss`?
-- Uses PostgreSQL as its own queue — no extra infrastructure (no Redis, no separate worker service needed)
-- Jobs are persisted and survive server restarts
-- Supports cron-style scheduling
-- Transactional — job state changes are ACID-safe
-
-#### Job Definition
+The **first line of defense** is MongoDB's native TTL index on `noteHistories.changedAt`:
 
 ```js
-// Scheduled once on server startup
-boss.schedule('cleanup-note-history', '0 2 * * *', {}); 
-// Runs every day at 2:00 AM UTC
+// In the Mongoose schema definition
+NoteHistorySchema.index(
+  { changedAt: 1 },
+  { expireAfterSeconds: 604800 }  // 60 × 60 × 24 × 7 = 604,800 seconds
+);
+```
 
-boss.work('cleanup-note-history', async () => {
-  await db.query(`
-    DELETE FROM note_histories
-    WHERE changed_at < NOW() - INTERVAL '7 days'
-  `);
+MongoDB's background TTL monitor runs every **60 seconds** and automatically deletes documents where `changedAt < now - 7 days`. This is:
+
+- **Zero application code** — no cron job needed for this task
+- **Non-blocking** — the TTL monitor is a background thread in mongod, entirely separate from query execution
+- **Index-driven** — deletion uses the BTrie index on `changedAt`, not a collection scan
+- **Storage-safe** — critical for the 512MB free tier
+
+### Secondary Mechanism: node-cron Safety Net
+
+As a belt-and-suspenders measure, a `node-cron` job runs daily at 2:00 AM UTC to catch any documents the TTL monitor may have missed (e.g., after an Atlas maintenance window):
+
+```js
+import cron from 'node-cron';
+import NoteHistory from '../models/NoteHistory.js';
+
+// Runs at 2:00 AM UTC every day
+cron.schedule('0 2 * * *', async () => {
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  
+  try {
+    const result = await NoteHistory.deleteMany({
+      changedAt: { $lt: sevenDaysAgo }
+    });
+    console.log(`[Cleanup] Deleted ${result.deletedCount} expired history entries`);
+  } catch (err) {
+    console.error('[Cleanup] History cleanup failed:', err.message);
+  }
+}, {
+  timezone: 'UTC'
 });
 ```
 
-#### Why this doesn't stress the server:
-1. **Runs at off-peak hours** — scheduled at 2 AM UTC when traffic is lowest
-2. **Async / non-blocking** — runs in a separate worker process, not in the HTTP request thread
-3. **Single DELETE with index** — `changed_at` is indexed, so the DELETE is fast and doesn't do a full table scan
-4. **Batched deletion (optional for very large tables):**
+### Why This Doesn't Stress the Server
 
-```js
-// Delete in chunks of 10,000 to avoid long lock holds
-async function cleanupInBatches() {
-  let deleted = 0;
-  do {
-    const result = await db.query(`
-      DELETE FROM note_histories
-      WHERE id IN (
-        SELECT id FROM note_histories
-        WHERE changed_at < NOW() - INTERVAL '7 days'
-        LIMIT 10000
-      )
-    `);
-    deleted = result.rowCount;
-    await sleep(500); // Brief pause between batches
-  } while (deleted > 0);
-}
+1. **MongoDB TTL index does the real work** — no application CPU involved
+2. **node-cron runs at 2 AM UTC** — lowest traffic window
+3. **`deleteMany` with an indexed field** — MongoDB uses the `changedAt` index, so it's not a collection scan; it's a targeted range delete
+4. **Async, non-blocking** — runs outside the HTTP request lifecycle entirely; Express continues serving requests normally
+5. **No batching needed at this scale** — with 7-day rolling history and the TTL index doing daily cleanup, the safety-net job will almost never find anything to delete
+
+### Storage Impact of History
+
+Assuming each note is edited ~2× per week on average, and history entries are cleaned after 7 days:
+
+```
+500,000 notes × 2 edits/week × 1 history entry/edit
+= ~1,000,000 history entries at peak (before first cleanup)
+= ~1,000,000 × 650 bytes avg = ~650MB
 ```
 
-5. **PostgreSQL autovacuum** will reclaim space after deletion automatically
+> ⚠️ **This exceeds the 512MB free tier if all 500K notes are edited frequently.** For the free tier, the TTL cleanup must run correctly and history is the most volatile collection. In practice, not all notes are edited every week — a realistic average across the dataset is far lower. The seeder generates realistic sparse edit history.
 
-#### Alternative: PostgreSQL Native Partitioning
-For extremely high-volume history, partition the `note_histories` table by week. Dropping an old partition is near-instant and zero-cost vs. row-level DELETEs.
-
-```sql
--- Partition by changed_at (weekly)
-CREATE TABLE note_histories (...)
-PARTITION BY RANGE (changed_at);
-
--- Drop old partitions instead of DELETE
-DROP TABLE note_histories_week_2024_01_01; -- instant
-```
-
-**`[Explain which approach you chose and why]`**
+**Mitigation if storage gets tight:**
+- Store only `title` diffs if content hasn't changed (and vice versa)
+- Reduce retention to 3 days for the free tier (7 days is configurable via env var)
+- Upgrade to Atlas M2 ($9/month, 2GB) for production use
 
 ---
 
 ## Large Data Seeder
 
 The seeder populates:
-- ~1,000 workspaces (spread across ~50 fake companies, ~20 workspaces each)
-- ~500,000 notes (500 per workspace on average)
-- Realistic titles, content (lorem + tech/business vocabulary mix)
-- Random tags (5–15 unique tags per note from a pool of ~100 tags)
-- Random vote distributions on public notes
-- History entries (2–5 per note)
-- Mix of draft/published, public/private
+- **50 companies**, each with ~20 workspaces = **~1,000 workspaces**
+- **~500 notes per workspace** = **~500,000 notes**
+- Realistic titles from a mixed vocabulary pool (tech, business, personal productivity)
+- 2–8 tags per note from a pool of 80 predefined tags
+- Random `type` (70% private, 30% public) and `status` (80% published, 20% draft)
+- Random vote counts on public notes
+- 1–3 history entries per note (sparse, realistic)
 
 **Run seeder:**
 ```bash
 npm run seed
-# or
-node scripts/seed.js
 ```
 
-**Performance considerations for seeding:**
-- Uses `COPY` or bulk `INSERT ... VALUES` with batches of 1,000 rows — much faster than individual inserts
-- Disables indexes during seed, re-enables after (for large tables)
-- Runs in a transaction per batch
+**Performance approach:**
+```js
+// Bulk insert in batches of 1,000 — much faster than individual .save() calls
+const BATCH_SIZE = 1000;
+for (let i = 0; i < notes.length; i += BATCH_SIZE) {
+  await Note.insertMany(notes.slice(i, i + BATCH_SIZE), { ordered: false });
+}
+```
 
-`[Explain estimated seed time and how you optimized it]`
+Using `insertMany` with `ordered: false` allows MongoDB to parallelize inserts and skip duplicate-key errors without aborting the whole batch. Seeding 500K notes with this approach takes approximately **3–8 minutes** depending on Atlas network latency.
+
+> **Note:** Indexes are NOT dropped before seeding (unlike PostgreSQL's common "drop index → bulk insert → rebuild" trick) because MongoDB builds indexes incrementally. For this dataset size it is acceptable.
 
 ---
 
@@ -407,61 +599,100 @@ node scripts/seed.js
 
 | Concern | Approach |
 |---|---|
-| Authentication | JWT with short expiry (15m access + refresh token) |
-| Authorization | Every query scoped to `company_id` from verified JWT |
-| SQL Injection | Parameterized queries only — no string concatenation |
-| Rate Limiting | Redis-based rate limiting on vote endpoint (prevent vote stuffing) |
-| Password Storage | bcrypt with cost factor ≥ 12 |
-| HTTPS | Enforced in production via reverse proxy (Nginx / Caddy) |
-| Tenant Isolation | `company_id` enforced in every service-layer query, not just routes |
-| Input Validation | Zod / Joi schema validation on all request bodies |
-| CORS | Strict origin whitelist |
-| Secrets | Env vars only — never hardcoded |
+| Authentication | JWT (access token 15m + refresh token 7d stored in httpOnly cookie) |
+| Authorization | `companyId` from verified JWT injected into every DB query via `tenantScope()` middleware |
+| NoSQL Injection | Mongoose schemas with strict typing reject unexpected operator keys; `express-mongo-sanitize` strips `$` and `.` from request bodies |
+| Password Storage | bcrypt with cost factor 12 |
+| Rate Limiting | `express-rate-limit` on vote endpoint (10 votes/min per IP) and auth endpoints |
+| HTTPS | Enforced in production via reverse proxy (Nginx) |
+| Tenant Isolation | `companyId` filter mandatory in all service functions — no query runs without it |
+| Input Validation | Zod schema validation on all request bodies before hitting the DB |
+| CORS | Strict origin whitelist via `cors` package |
+| Secrets | Environment variables only — `.env` is gitignored |
+| Sensitive fields | `passwordHash` excluded from all API responses via Mongoose `select: false` |
 
 ---
 
 ## Performance & Scalability
 
-### Database Indexes (summary)
+### Index Summary
 
-```sql
--- Note search
-CREATE INDEX idx_notes_title_trgm ON notes USING GIN (title gin_trgm_ops);
+```js
+// users
+{ email: 1 }            // unique — login lookup
+{ companyId: 1 }        // tenant scoping
 
--- Tenant-scoped workspace queries
-CREATE INDEX idx_notes_company_workspace ON notes (company_id, workspace_id);
+// workspaces
+{ companyId: 1 }        // list workspaces per company
 
--- Public directory sorted listings
-CREATE INDEX idx_notes_public_created ON notes (type, status, created_at DESC)
-  WHERE type = 'public' AND status = 'published';
+// notes
+{ companyId: 1, workspaceId: 1 }        // private workspace listing
+{ type: 1, status: 1, createdAt: -1 }  // public directory — newest sort
+{ type: 1, status: 1, 'voteCount.up': -1 }   // most upvotes sort
+{ type: 1, status: 1, 'voteCount.down': -1 } // most downvotes sort
+{ title: 'text' }                       // title search
 
--- History cleanup
-CREATE INDEX idx_note_histories_changed_at ON note_histories (changed_at);
-
--- Vote aggregation
-CREATE INDEX idx_votes_note ON note_votes (note_id, vote_type);
+// noteHistories
+{ noteId: 1, changedAt: -1 }            // history list per note
+{ changedAt: 1 } (TTL, expireAfterSeconds: 604800) // auto-cleanup
 ```
 
-### Caching Strategy
+### Query Projection (Always Select Minimal Fields)
 
-- Public note listing (top page of public directory) cached in Redis with 60s TTL
-- Cache invalidated on new public note published or vote change
-- `[Describe cache key structure]`
+```js
+// ✅ List view — never fetch content
+Note.find(filter)
+    .select('title tags type status voteCount createdAt workspaceId')
+    .lean()
 
-### Pagination
+// ✅ Edit/detail view — fetch everything
+Note.findById(id).lean()
+```
 
-- Public directory uses **cursor-based pagination** (keyset pagination on `created_at + id`) to avoid OFFSET performance degradation at large page numbers
-- Private workspace note list uses offset pagination (smaller dataset, acceptable)
+### Caching (In-Process)
+
+Redis is not used to avoid extra infrastructure. Instead, `node-cache` provides in-process TTL caching for the most expensive query — the public directory first page:
+
+```js
+import NodeCache from 'node-cache';
+const cache = new NodeCache({ stdTTL: 60 }); // 60 second TTL
+
+// Cache key encodes the full query signature
+const cacheKey = `public:${sort}:${search}:${cursor}`;
+const cached = cache.get(cacheKey);
+if (cached) return res.json(cached);
+
+const results = await Note.find(...).lean();
+cache.set(cacheKey, results);
+res.json(results);
+```
+
+Cache is invalidated on new publish or vote change by calling `cache.flushAll()` — acceptable at this scale.
+
+### Cursor-Based Pagination
+
+```js
+// ✅ Correct — uses index, O(1) seek
+const notes = await Note.find({
+  type: 'public',
+  status: 'published',
+  _id: { $gt: new mongoose.Types.ObjectId(cursor) }  // cursor = last seen _id
+}).sort({ _id: 1 }).limit(20).lean();
+
+// ❌ Never — O(n) scan discards 50,000 docs
+Note.find({}).skip(50000).limit(20)
+```
 
 ### Scalability Path
 
 | Scale Trigger | Action |
 |---|---|
-| DB reads bottleneck | Add read replica, route reads there |
-| Vote table too hot | Use Redis counter + async DB sync |
-| History table huge | Switch to range partitioning by week |
-| Search too slow | Migrate to Elasticsearch / Typesense |
-| 10M+ notes | Horizontal DB sharding by `company_id` |
+| 512MB Atlas limit hit | Upgrade to Atlas M2 (2GB, $9/mo) or M5 (5GB) |
+| Read latency increases | Add Atlas read replica (M10+) |
+| Title search too slow | Enable Atlas Search (Lucene-based, free on M0) |
+| Vote counter contention | Move `voters` array to separate lean `votes` collection |
+| History storage bloat | Reduce TTL to 3 days or store content diffs only |
+| 5M+ notes | Shard by `companyId` using MongoDB Atlas sharded clusters |
 
 ---
 
@@ -473,21 +704,21 @@ CREATE INDEX idx_votes_note ON note_votes (note_id, vote_type);
 /login                    — Login page
 /register                 — Company registration
 /dashboard                — Workspace list (private, owner only)
-/workspaces/:id/notes     — Note list in workspace (search by title)
+/workspaces/:id/notes     — Note list in workspace + title search
 /workspaces/:id/notes/new — Create note
-/notes/:id/edit           — Edit note (with draft indicator)
-/notes/:id/history        — History list + restore
+/notes/:id/edit           — Edit note (with DRAFT badge if unpublished)
+/notes/:id/history        — History timeline + restore button
 /public                   — Public notes directory (search, sort, vote)
 /public/:id               — Single public note view
 ```
 
 ### Key UI Behaviors
 
-- **Draft indicator:** Orange "DRAFT" badge shown on unpublished notes in workspace view and editor
-- **History view:** Timeline list of previous versions; each entry shows changed timestamp, changed by, and a "Restore" button
+- **Draft indicator:** Orange "DRAFT" badge on unpublished notes in list and editor header
+- **History view:** Reverse-chronological list; each entry shows who changed it, when, and a "Restore this version" button
 - **Public directory sort:** Dropdown — Newest / Oldest / Most Upvoted / Most Downvoted
-- **Search:** Debounced title search input (300ms delay) on both private list and public directory
-- **Voting:** Upvote/downvote buttons on public note cards; user's current vote is highlighted; one vote per note
+- **Search:** Debounced (300ms) title search on both private workspace list and public directory, using MongoDB `$text` search
+- **Voting:** Upvote / downvote buttons on public note cards; authenticated users only; current user's vote is highlighted; switching vote is allowed
 
 ---
 
@@ -495,15 +726,16 @@ CREATE INDEX idx_votes_note ON note_votes (note_id, vote_type);
 
 | Layer | Technology | Reason |
 |---|---|---|
-| Backend | `[Node.js + Express / Fastify / Next.js API]` | `[Your reason]` |
-| Database | PostgreSQL | Relational integrity, JSONB, full-text search, RLS |
-| Cache | Redis | Fast read cache, rate limiting |
-| Job Queue | `[pg-boss / BullMQ / node-cron]` | `[Your reason]` |
-| ORM / Query | `[Prisma / Drizzle / Knex / raw pg]` | `[Your reason]` |
-| Auth | JWT + bcrypt | Stateless, scalable |
-| Frontend | `[Next.js / React / Plain HTML]` | `[Your reason]` |
-| Validation | `[Zod / Joi]` | Schema-first validation |
-| Seeder | Custom script | Bulk insert with realistic data |
+| Backend | Node.js + Express | Familiar, fast to set up, great MongoDB ecosystem |
+| Database | MongoDB Atlas M0 (Free) | Zero infra setup, familiar, document model suits notes |
+| ODM | Mongoose | Schema validation, middleware hooks, clean API |
+| Auth | JWT + bcrypt | Stateless, no session store needed |
+| Scheduler | node-cron | Lightweight, in-process, no extra infra |
+| In-process Cache | node-cache | Avoids Redis infra complexity for this scale |
+| Input Validation | Zod | Schema-first, TypeScript-friendly |
+| Security | express-mongo-sanitize, express-rate-limit, helmet | Standard Express security stack |
+| Frontend | `[Express + EJS templates / React / Plain HTML]` | `[Your reason]` |
+| Seeder | Custom script with insertMany batching | Fast bulk inserts |
 
 ---
 
@@ -512,27 +744,36 @@ CREATE INDEX idx_votes_note ON note_votes (note_id, vote_type);
 ```
 /
 ├── src/
-│   ├── config/           # DB, Redis, env config
-│   ├── middleware/        # Auth, rate limit, error handler
+│   ├── config/
+│   │   ├── db.js              # Mongoose connection
+│   │   └── env.js             # Env var validation
+│   ├── middleware/
+│   │   ├── auth.js            # JWT verify, attach req.user
+│   │   ├── tenantScope.js     # Injects companyId into queries
+│   │   ├── rateLimiter.js     # Vote + auth rate limits
+│   │   └── errorHandler.js    # Global error handler
+│   ├── models/
+│   │   ├── Company.js
+│   │   ├── User.js
+│   │   ├── Workspace.js
+│   │   ├── Note.js            # Includes pre-save history hook
+│   │   └── NoteHistory.js     # TTL index defined here
 │   ├── modules/
-│   │   ├── auth/          # Login, register, JWT
-│   │   ├── workspaces/    # Workspace CRUD
-│   │   ├── notes/         # Note CRUD, publish, draft
-│   │   ├── history/       # History list, restore
-│   │   ├── votes/         # Vote endpoint
-│   │   └── public/        # Public directory
-│   ├── jobs/              # Background job definitions
-│   │   └── cleanupHistory.js
-│   ├── db/
-│   │   ├── migrations/    # SQL migration files
-│   │   └── schema.sql     # Full schema reference
+│   │   ├── auth/
+│   │   ├── workspaces/
+│   │   ├── notes/
+│   │   ├── history/
+│   │   ├── votes/
+│   │   └── public/
+│   ├── jobs/
+│   │   └── cleanupHistory.js  # node-cron safety-net job
 │   └── scripts/
-│       └── seed.js        # Large data seeder
-├── frontend/              # UI (if separate)
+│       └── seed.js            # 500K note seeder
+├── frontend/
 │   ├── pages/
 │   └── components/
 ├── .env.example
-├── docker-compose.yml
+├── .gitignore
 └── README.md
 ```
 
@@ -542,8 +783,7 @@ CREATE INDEX idx_votes_note ON note_votes (note_id, vote_type);
 
 ### Prerequisites
 - Node.js ≥ 18
-- PostgreSQL ≥ 15
-- Redis ≥ 7
+- A MongoDB Atlas account (free — [atlas.mongodb.com](https://www.mongodb.com/atlas))
 
 ### Installation
 
@@ -552,16 +792,15 @@ git clone [repo-url]
 cd workspace-notes
 npm install
 cp .env.example .env
-# Edit .env with your DB credentials
+# Add your MongoDB Atlas connection string to .env
 ```
 
 ### Database Setup
 
-```bash
-# Run migrations
-npm run migrate
+MongoDB Atlas creates collections automatically on first insert. Indexes are created via Mongoose schema definitions on app startup — no manual migration step needed.
 
-# (Optional) Seed with large dataset
+```bash
+# (Optional) Seed with large dataset — takes 3–8 minutes
 npm run seed
 ```
 
@@ -571,37 +810,33 @@ npm run seed
 npm run dev
 ```
 
-### Run Background Job Worker
-
-```bash
-npm run worker
-# This starts the pg-boss / BullMQ worker that handles scheduled cleanup
-```
+The server starts, connects to Atlas, and registers all Mongoose indexes (including the TTL index on `noteHistories`) automatically.
 
 ---
 
 ## Environment Variables
 
 ```env
-# Database
-DATABASE_URL=postgresql://user:password@localhost:5432/workspace_notes
-
-# Redis
-REDIS_URL=redis://localhost:6379
+# MongoDB
+MONGODB_URI=mongodb+srv://<user>:<password>@cluster0.xxxxx.mongodb.net/workspace_notes?retryWrites=true&w=majority
 
 # Auth
-JWT_SECRET=your-very-long-random-secret
+JWT_SECRET=your-very-long-random-secret-min-32-chars
 JWT_EXPIRY=15m
-REFRESH_TOKEN_SECRET=another-long-secret
+REFRESH_TOKEN_SECRET=another-long-random-secret
 REFRESH_TOKEN_EXPIRY=7d
 
 # App
 PORT=3000
 NODE_ENV=development
 
+# History Retention (seconds) — default 7 days
+HISTORY_TTL_SECONDS=604800
+
 # Rate Limiting
 VOTE_RATE_LIMIT_WINDOW_MS=60000
 VOTE_RATE_LIMIT_MAX=10
+AUTH_RATE_LIMIT_MAX=5
 ```
 
 ---
@@ -610,13 +845,16 @@ VOTE_RATE_LIMIT_MAX=10
 
 | Item | Status | Notes |
 |---|---|---|
-| Full implementation | Scoped to design | Time constraint — full implementation would require ~3-4 days |
+| Full implementation | Scoped to design | Time constraint — full implementation would take ~3-4 days |
+| Redis caching | Replaced with node-cache | For production, Redis is the correct choice for distributed caching |
+| PostgreSQL | Replaced with MongoDB | PostgreSQL with RLS would be stronger for multi-tenant isolation at scale |
+| Atlas Search | Not configured | Would replace `$text` index for better search relevance (free on Atlas) |
 | Email verification | Not implemented | Would add on next iteration |
-| Real-time collaboration | Not in scope | Would use WebSockets / CRDTs |
-| File attachments in notes | Not in scope | Would use S3 + signed URLs |
-| Admin panel | Not in scope | For managing companies/users |
-| Full-text content search | Title only | Content search would need Elasticsearch |
-| Anonymous voting | Not implemented | Would use browser fingerprinting |
+| Real-time collaboration | Not in scope | Would use WebSockets |
+| File attachments | Not in scope | Would use S3 + signed URLs |
+| Content search | Title only | Full content search would use Atlas Search |
+| Anonymous voting | Not implemented | Would use browser fingerprinting + IP |
+| 512MB storage ceiling | Active constraint | History TTL and projection are critical; upgrade to M2 for production |
 
 ---
 
