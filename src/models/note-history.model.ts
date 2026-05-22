@@ -1,13 +1,4 @@
-// ============================================================
-// models/NoteHistory.ts
-//
-// Snapshot written automatically before every note update.
-// Stores previous state so any version can be restored.
-//
-// TTL index on createdAt handles 7-day cleanup automatically.
-// MongoDB background reaper (~60s cycle) deletes expired docs.
-// No cron job, no external scheduler, zero server load.
-// ============================================================
+
 import mongoose, { Document, Schema, Types } from 'mongoose';
 
 export interface INoteHistory extends Document {

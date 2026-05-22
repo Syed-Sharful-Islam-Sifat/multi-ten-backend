@@ -1,11 +1,4 @@
-// ============================================================
-// models/LoginOtp.ts
-//
-// Stores bcrypt hash of 6-digit OTP — raw code never persisted.
-// TTL index auto-deletes expired OTPs — no cron needed.
-// attempts counter prevents brute force on a specific token.
-// isUsed flag burns the token after first successful verification.
-// ============================================================
+
 import mongoose, { Document, Schema, Types } from 'mongoose';
 
 export interface ILoginOtp extends Document {
