@@ -875,35 +875,38 @@ Note.find({}).skip(50000).limit(20)
 /
 ├── src/
 │   ├── config/
-│   │   ├── db.js              # Mongoose connection
-│   │   └── env.js             # Env var validation
+│   │   ├── db.ts              # Mongoose connection
+│   │   └── env.ts             # Env var validation (Zod)
 │   ├── middleware/
-│   │   ├── auth.js            # JWT verify, attach req.user
-│   │   ├── tenantScope.js     # Injects companyId into queries
-│   │   ├── rateLimiter.js     # Vote + auth rate limits
-│   │   └── errorHandler.js    # Global error handler
+│   │   ├── auth.ts            # JWT verify, attach req.user
+│   │   ├── tenantScope.ts     # Injects companyId into all queries
+│   │   ├── rateLimiter.ts     # OTP, vote, auth rate limits
+│   │   └── errorHandler.ts    # Global error handler
 │   ├── models/
-│   │   ├── Company.js
-│   │   ├── User.js
-│   │   ├── Workspace.js
-│   │   ├── Note.js            # Includes pre-save history hook
-│   │   └── NoteHistory.js     # TTL index defined here
+│   │   ├── Company.ts         # isVerified, email unique index
+│   │   ├── User.ts            # companyId+email compound unique, isActive
+│   │   ├── Workspace.ts       # companyId + name indexes
+│   │   ├── Note.ts            # isDraft + noteType dual-axis, votesCache, publishedAt
+│   │   ├── NoteHistory.ts     # changedAt TTL index (7 days)
+│   │   ├── NoteVote.ts        # noteId+voterId unique index, value +1/-1
+│   │   └── LoginOtp.ts        # otpHash (bcrypt), attempts, expiresAt TTL index
 │   ├── modules/
-│   │   ├── auth/
-│   │   ├── workspaces/
-│   │   ├── notes/
-│   │   ├── history/
-│   │   ├── votes/
-│   │   └── public/
+│   │   ├── auth/              # OTP request, OTP verify, token refresh
+│   │   ├── workspaces/        # Workspace CRUD
+│   │   ├── notes/             # Note CRUD, publish
+│   │   ├── history/           # History list, restore
+│   │   ├── votes/             # Vote cast, change, retract
+│   │   └── public/            # Public directory listing
 │   ├── jobs/
-│   │   └── cleanupHistory.js  # node-cron safety-net job
+│   │   └── cleanupHistory.ts  # node-cron safety-net (TTL index is primary)
 │   └── scripts/
-│       └── seed.js            # 500K note seeder
+│       └── seed.ts            # 500K note seeder with insertMany batching
 ├── frontend/
 │   ├── pages/
 │   └── components/
 ├── .env.example
 ├── .gitignore
+├── tsconfig.json
 └── README.md
 ```
 
@@ -922,12 +925,12 @@ git clone [repo-url]
 cd workspace-notes
 npm install
 cp .env.example .env
-# Add your MongoDB Atlas connection string to .env
+# Add your MongoDB Atlas connection string and SMTP config to .env
 ```
 
 ### Database Setup
 
-MongoDB Atlas creates collections automatically on first insert. Indexes are created via Mongoose schema definitions on app startup — no manual migration step needed.
+MongoDB Atlas creates collections automatically on first insert. All indexes (including the TTL indexes on `loginotps.expiresAt` and `notehistories.changedAt`) are declared in Mongoose schemas and registered automatically on app startup — no manual migration step needed.
 
 ```bash
 # (Optional) Seed with large dataset — takes 3–8 minutes
@@ -940,7 +943,7 @@ npm run seed
 npm run dev
 ```
 
-The server starts, connects to Atlas, and registers all Mongoose indexes (including the TTL index on `noteHistories`) automatically.
+The server starts, connects to Atlas, and registers all Mongoose indexes automatically. Check the console for `[MongoDB] Connected` and `[Indexes] All ensured` confirmation logs.
 
 ---
 
@@ -950,23 +953,32 @@ The server starts, connects to Atlas, and registers all Mongoose indexes (includ
 # MongoDB
 MONGODB_URI=mongodb+srv://<user>:<password>@cluster0.xxxxx.mongodb.net/workspace_notes?retryWrites=true&w=majority
 
-# Auth
+# JWT
 JWT_SECRET=your-very-long-random-secret-min-32-chars
 JWT_EXPIRY=15m
-REFRESH_TOKEN_SECRET=another-long-random-secret
+REFRESH_TOKEN_SECRET=another-long-random-secret-min-32-chars
 REFRESH_TOKEN_EXPIRY=7d
+
+# OTP
+OTP_EXPIRY_MINUTES=10         # How long before an OTP link expires
+OTP_BCRYPT_ROUNDS=10          # bcrypt cost factor for OTP hashing
+SMTP_HOST=smtp.example.com    # Email delivery for OTP codes
+SMTP_PORT=587
+SMTP_USER=your@email.com
+SMTP_PASS=yourpassword
 
 # App
 PORT=3000
 NODE_ENV=development
 
-# History Retention (seconds) — default 7 days
-HISTORY_TTL_SECONDS=604800
+# History Retention
+HISTORY_TTL_SECONDS=604800    # 7 days — also set in TTL index on model
 
 # Rate Limiting
 VOTE_RATE_LIMIT_WINDOW_MS=60000
 VOTE_RATE_LIMIT_MAX=10
-AUTH_RATE_LIMIT_MAX=5
+OTP_RATE_LIMIT_MAX=5          # Max OTP requests per window per IP
+AUTH_RATE_LIMIT_MAX=10
 ```
 
 ---
@@ -975,16 +987,16 @@ AUTH_RATE_LIMIT_MAX=5
 
 | Item | Status | Notes |
 |---|---|---|
-| Full implementation | Scoped to design | Time constraint — full implementation would take ~3-4 days |
+| API route handlers + service layer | Not yet implemented | Models + schema design complete; routes are next |
+| Frontend UI | Not yet implemented | Page map and behaviors documented above |
 | Redis caching | Replaced with node-cache | For production, Redis is the correct choice for distributed caching |
 | PostgreSQL | Replaced with MongoDB | PostgreSQL with RLS would be stronger for multi-tenant isolation at scale |
-| Atlas Search | Not configured | Would replace `$text` index for better search relevance (free on Atlas) |
-| Email verification | Not implemented | Would add on next iteration |
-| Real-time collaboration | Not in scope | Would use WebSockets |
-| File attachments | Not in scope | Would use S3 + signed URLs |
-| Content search | Title only | Full content search would use Atlas Search |
-| Anonymous voting | Not implemented | Would use browser fingerprinting + IP |
-| 512MB storage ceiling | Active constraint | History TTL and projection are critical; upgrade to M2 for production |
+| Atlas Search | Using compound indexes for title sort | Atlas Search (Lucene) would give better relevance; free on Atlas M0 |
+| Real-time collaboration | Not in scope | Would use WebSockets / CRDTs |
+| File attachments in notes | Not in scope | Would use S3 + signed URLs |
+| Content search | Title-prefix only | Full content search would need Atlas Search |
+| 512MB storage ceiling | Active constraint | History TTL and `NoteVote` lean documents are critical; upgrade to M2 for production |
+| SMTP for OTP delivery | Env var configured, not wired | SMTP client (Nodemailer) needs to be connected to OTP request handler |
 
 ---
 
@@ -992,4 +1004,4 @@ AUTH_RATE_LIMIT_MAX=5
 
 `Syed Sharful Islam Sifat`  
 Built as part of a Full-Stack Developer assessment task  
-Date: `May 22, 2026`
+Date: `22 May 2026`
