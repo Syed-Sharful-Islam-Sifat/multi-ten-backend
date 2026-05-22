@@ -85,8 +85,6 @@ Notes are naturally document-shaped. Tags, vote counts, and metadata live comfor
 }
 ```
 
-### 3. Atlas Free Tier Available Immediately
-MongoDB Atlas M0 (free tier) spins up in under 2 minutes with no credit card. This meant I could start building immediately without any local Docker/Postgres setup overhead during the assessment.
 
 ### 4. Mongoose ODM is Productive
 Mongoose provides schema validation, middleware hooks (for auto-creating history on save), TTL index declarations, and a clean API — all things that would take longer to wire up manually with a raw SQL client under time pressure. The `LoginOtp` model is a good example: TTL index, bcrypt hash storage, and brute-force `attempts` counter are all declared declaratively in one schema file.
@@ -226,7 +224,7 @@ Note.find({ _id: { $gt: lastSeenId }, type: 'public', status: 'published' })
 
 ## Database Design
 
-> 📎 **Full Schema Diagram Link:** `[Insert link — use MongoDB Compass schema view export, or draw at dbdiagram.io]`
+> 📎 **Full Schema Diagram Link:** `[https://dbdiagram.io/d/multi-tenant-backend-db-design-6a0ff43fb62396d22c448205]`
 
 ### Collection Overview
 
