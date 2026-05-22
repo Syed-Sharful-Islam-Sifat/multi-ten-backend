@@ -1,224 +1,627 @@
-# BuddyScript — Backend
+# Multitenant — Backend
 
-BuddyScript is a social networking platform built to handle posts, comments, replies, and a like system at scale. This document covers the backend architecture, design decisions, and how to run the project.
+This is a detailed explanation of Secure SaaS notes system. I have tried to explain how I have thought about the system by the time of implementation I found this is a complex system that can't be implemented with that much of time so I decided rather implementing the system it will be feasible to sketch the whole system design if the design is crystal clear then implementation will not take much time
 
-## Table of Contents
+# 🗒️ Workspace Notes — Multi-Tenant SaaS Notes System
 
-1. [Project Overview](#project-overview)
-2. [Tech Stack](#tech-stack)
-3. [Data Models](#data-models)
-4. [Application Architecture](#application-architecture)
-5. [Request Flow](#request-flow)
-6. [Core Modules](#core-modules)
-7. [Running the Project](#running-the-project)
-8. [Environment Variables](#environment-variables)
+> A production-grade, multi-tenant SaaS notes platform built for companies to manage workspaces, collaborate on notes, and publish content publicly.
+
+---
+
+## 📑 Table of Contents
+
+- [Project Overview](#project-overview)
+- [System Architecture](#system-architecture)
+- [Database Design](#database-design)
+- [API Design](#api-design)
+- [Core Features](#core-features)
+  - [Multi-Tenancy](#multi-tenancy)
+  - [Draft Mode](#draft-mode)
+  - [History System](#history-system)
+  - [Note Voting](#note-voting)
+  - [Public Directory](#public-directory)
+- [History Cleanup Strategy (7-Day Retention)](#history-cleanup-strategy-7-day-retention)
+- [Large Data Seeder](#large-data-seeder)
+- [Security Considerations](#security-considerations)
+- [Performance & Scalability](#performance--scalability)
+- [UI Pages & Flows](#ui-pages--flows)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+- [Environment Variables](#environment-variables)
+- [Known Limitations & Future Work](#known-limitations--future-work)
 
 ---
 
 ## Project Overview
 
-A social media backend needs to handle high read volume, concurrent writes, and relationships between users, posts, comments, and likes. At true scale this calls for independent services — a dedicated post service, user service, and feed service — so that each can be scaled, deployed, and failed independently.
+**Workspace Notes** is a multi-tenant SaaS application where multiple companies can sign up, create workspaces, and manage notes within those workspaces. Notes can be private (visible only to workspace members) or public (listed in a public directory accessible by anyone).
 
-For this project, a monolithic architecture was chosen deliberately. The timeline did not justify the operational overhead of microservices (separate deployments, inter-service communication, distributed tracing), and a well-structured monolith with clear internal boundaries is the right tradeoff at this stage. The internal separation between routes, controllers, and services means extraction into independent services later is a refactor, not a rewrite.
+**Key design goals:**
+- Multi-tenancy with strict data isolation between companies
+- Fast read performance on large datasets (~500K+ notes)
+- Secure by default (auth, authorization, input sanitization)
+- Offloaded background jobs for maintenance tasks (e.g., history cleanup)
+- Simple but functional UI
 
-MongoDB was chosen for two reasons: the document model fits the data naturally — a post with an author reference and metadata is one document, not a join across tables — and it is where familiarity sits. Using a tool you know well under a deadline produces better code than learning a new one under pressure.
+**What was scoped for design (not full implementation due to time constraints):**
+- Full system design, database schema, API contract, background job strategy, and UI wireflow are documented here
+- Partial implementation covers: `[list what was actually implemented]`
+
+---
+
+## System Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                          Client (Browser)                        │
+│              Next.js / React SPA / Plain HTML+JS                 │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │ HTTP/REST (or tRPC)
+┌────────────────────────────▼─────────────────────────────────────┐
+│                        API Server (Node.js)                      │
+│              Express / Fastify / Next.js API Routes              │
+│                                                                  │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │
+│   │  Auth Layer  │  │  Note Router │  │  Public Dir Router   │  │
+│   │  (JWT/Session│  │  (CRUD, Vote)│  │  (Public Listings)   │  │
+│   └──────────────┘  └──────────────┘  └──────────────────────┘  │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │
+          ┌──────────────────┼──────────────────┐
+          │                  │                  │
+┌─────────▼──────┐  ┌────────▼───────┐  ┌──────▼──────────┐
+│   PostgreSQL   │  │     Redis      │  │  Job Queue       │
+│  (Primary DB)  │  │  (Cache/Rate   │  │  (BullMQ /       │
+│                │  │   Limiting)    │  │   pg-boss /      │
+│                │  │                │  │   cron offload)  │
+└────────────────┘  └────────────────┘  └─────────────────┘
+```
+
+**Architecture decisions:**
+- `[Explain why you chose your framework — e.g., Next.js for SSR + API routes in one repo]`
+- `[Explain why PostgreSQL — relational integrity, JSONB for tags, full-text search]`
+- `[Explain why Redis — caching hot public note listings, rate limiting votes]`
+- `[Explain job queue choice — pg-boss keeps it in Postgres, no extra infra; BullMQ needs Redis but more robust]`
+
+---
+
+## Database Design
+
+> 📎 **Full ERD Link:** `[Insert link to your DB diagram — dbdiagram.io, Lucidchart, DrawSQL, etc.]`
+
+### Entity Overview
+
+```
+companies
+  └── workspaces
+        └── notes
+              ├── note_tags  →  tags
+              ├── note_votes
+              └── note_histories
+users
+  └── (belongs to a company)
+```
+
+### Tables
+
+#### `companies`
+| Column       | Type        | Notes                        |
+|--------------|-------------|------------------------------|
+| id           | UUID (PK)   | Primary key                  |
+| name         | VARCHAR     | Company name                 |
+| slug         | VARCHAR     | Unique URL-safe identifier   |
+| created_at   | TIMESTAMPTZ |                              |
+
+#### `users`
+| Column       | Type        | Notes                                  |
+|--------------|-------------|----------------------------------------|
+| id           | UUID (PK)   |                                        |
+| company_id   | UUID (FK)   | Tenant isolation — scoped to company   |
+| email        | VARCHAR     | Unique                                 |
+| password_hash| VARCHAR     |                                        |
+| role         | ENUM        | `owner`, `member`                      |
+| created_at   | TIMESTAMPTZ |                                        |
+
+#### `workspaces`
+| Column       | Type        | Notes                              |
+|--------------|-------------|-------------------------------------|
+| id           | UUID (PK)   |                                     |
+| company_id   | UUID (FK)   | Tenant scoping                      |
+| name         | VARCHAR     |                                     |
+| created_at   | TIMESTAMPTZ |                                     |
+
+#### `notes`
+| Column         | Type        | Notes                                             |
+|----------------|-------------|---------------------------------------------------|
+| id             | UUID (PK)   |                                                   |
+| workspace_id   | UUID (FK)   |                                                   |
+| company_id     | UUID (FK)   | Denormalized for faster tenant-scoped queries     |
+| title          | VARCHAR     | Indexed for search                                |
+| content        | TEXT        |                                                   |
+| type           | ENUM        | `public`, `private`                               |
+| status         | ENUM        | `draft`, `published`                              |
+| created_by     | UUID (FK → users) |                                             |
+| updated_by     | UUID (FK → users) |                                             |
+| created_at     | TIMESTAMPTZ |                                                   |
+| updated_at     | TIMESTAMPTZ |                                                   |
+
+> **Index strategy:**
+> - `(company_id, workspace_id)` — tenant-scoped workspace queries
+> - `(type, status)` — public published note listings
+> - `title` with `pg_trgm` GIN index — fast ILIKE / full-text title search
+> - `(type, status, created_at DESC)` — public directory sorted by newest
+
+#### `tags`
+| Column | Type      | Notes          |
+|--------|-----------|----------------|
+| id     | UUID (PK) |                |
+| name   | VARCHAR   | Unique per tag |
+
+#### `note_tags` *(junction table)*
+| Column  | Type      |
+|---------|-----------|
+| note_id | UUID (FK) |
+| tag_id  | UUID (FK) |
+
+> Composite PK on `(note_id, tag_id)`
+
+#### `note_votes`
+| Column      | Type      | Notes                                        |
+|-------------|-----------|----------------------------------------------|
+| id          | UUID (PK) |                                              |
+| note_id     | UUID (FK) |                                              |
+| voter_id    | UUID (FK) | Can be user or anonymous fingerprint         |
+| company_id  | UUID (FK) | The voter's company (for cross-company votes)|
+| vote_type   | ENUM      | `upvote`, `downvote`                         |
+| created_at  | TIMESTAMPTZ |                                            |
+
+> Unique constraint on `(note_id, voter_id)` — one vote per user per note.
+
+#### `note_histories`
+| Column       | Type        | Notes                                      |
+|--------------|-------------|--------------------------------------------|
+| id           | UUID (PK)   |                                            |
+| note_id      | UUID (FK)   |                                            |
+| prev_title   | VARCHAR     | Snapshot of title before change            |
+| prev_content | TEXT        | Snapshot of content before change          |
+| changed_by   | UUID (FK → users) |                                      |
+| changed_at   | TIMESTAMPTZ | Indexed — used for 7-day TTL cleanup       |
+
+> **Index:** `(note_id, changed_at DESC)` — fast history retrieval per note  
+> **Cleanup index:** `changed_at` — used by background job to delete old records
+
+---
+
+## API Design
+
+> All endpoints are prefixed with `/api/v1`
+
+### Auth
+| Method | Endpoint            | Description          |
+|--------|---------------------|----------------------|
+| POST   | `/auth/register`    | Register company + owner user |
+| POST   | `/auth/login`       | Login, returns JWT   |
+| POST   | `/auth/logout`      | Invalidate session   |
+
+### Workspaces *(authenticated, tenant-scoped)*
+| Method | Endpoint                     | Description            |
+|--------|------------------------------|------------------------|
+| GET    | `/workspaces`                | List my company's workspaces |
+| POST   | `/workspaces`                | Create workspace       |
+| GET    | `/workspaces/:id`            | Get single workspace   |
+| PUT    | `/workspaces/:id`            | Update workspace       |
+| DELETE | `/workspaces/:id`            | Delete workspace       |
+
+### Notes *(authenticated)*
+| Method | Endpoint                            | Description                        |
+|--------|-------------------------------------|------------------------------------|
+| GET    | `/workspaces/:wid/notes`            | List notes in workspace (private)  |
+| POST   | `/workspaces/:wid/notes`            | Create note                        |
+| GET    | `/workspaces/:wid/notes/:id`        | Get note detail                    |
+| PUT    | `/workspaces/:wid/notes/:id`        | Update note (triggers history)     |
+| DELETE | `/workspaces/:wid/notes/:id`        | Delete note                        |
+| POST   | `/workspaces/:wid/notes/:id/publish`| Publish a draft note               |
+
+### Note History *(authenticated)*
+| Method | Endpoint                                     | Description               |
+|--------|----------------------------------------------|---------------------------|
+| GET    | `/notes/:id/history`                         | List history entries      |
+| POST   | `/notes/:id/history/:hid/restore`            | Restore a history entry   |
+
+### Public Directory *(unauthenticated)*
+| Method | Endpoint                       | Description                                            |
+|--------|--------------------------------|--------------------------------------------------------|
+| GET    | `/public/notes`                | List all public published notes (sortable, searchable) |
+| GET    | `/public/notes/:id`            | Single public note detail                              |
+| POST   | `/public/notes/:id/vote`       | Upvote or downvote a public note                       |
+
+**Query params for `/public/notes`:**
+- `search=` — title search (ILIKE with trigram index)
+- `sort=` — `newest`, `oldest`, `most_upvotes`, `most_downvotes`
+- `page=`, `limit=` — pagination (cursor-based preferred at scale)
+
+---
+
+## Core Features
+
+### Multi-Tenancy
+
+Every database query is scoped by `company_id`. This is enforced at the service layer, not just the route level.
+
+**Strategy:**
+- `company_id` is extracted from the authenticated JWT on every request
+- All queries include `WHERE company_id = $company_id` — no exceptions
+- Row-Level Security (RLS) in PostgreSQL can be used as an additional backstop
+
+```
+// Pseudocode — every note query is tenant-scoped
+getNotes(companyId, workspaceId) {
+  SELECT * FROM notes
+  WHERE company_id = $companyId
+    AND workspace_id = $workspaceId
+}
+```
+
+### Draft Mode
+
+- Notes have a `status` field: `draft` | `published`
+- Drafts are **never** included in public directory listings
+- Draft notes are only visible to the owning workspace members
+- Publishing a draft: `POST /notes/:id/publish` — sets `status = 'published'`
+- UI shows a "DRAFT" badge on unpublished notes in the private workspace view
+
+### History System
+
+- On every `PUT /notes/:id` request, before applying the update:
+  1. Read current `title` + `content` from DB
+  2. Insert a row into `note_histories` with the previous values + `changed_by` + `changed_at = NOW()`
+  3. Apply the new update to `notes`
+- Users can view history via the history page and click "Restore" to revert
+
+**Restore flow:**
+1. `POST /notes/:id/history/:hid/restore`
+2. Server reads `prev_title` and `prev_content` from the history entry
+3. Server saves current state as a new history entry (so restore is itself undoable)
+4. Applies the historical values to the current note
+
+### Note Voting
+
+- Any authenticated user (including from other companies) can vote on public notes
+- Unique constraint prevents double voting: `(note_id, voter_id)`
+- Vote counts are aggregated with `COUNT(CASE WHEN vote_type = 'upvote' THEN 1 END)` — or maintained as a denormalized counter column updated via trigger/service for performance
+- `[Explain your chosen vote count strategy — real-time aggregate vs. cached counter]`
+
+### Public Directory
+
+- Lists all notes where `type = 'public' AND status = 'published'`
+- Includes workspace name and tags in the response
+- Supports sorting and title search
+- No authentication required
+
+---
+
+## History Cleanup Strategy (7-Day Retention)
+
+### The Problem
+With ~500K notes and frequent edits, the `note_histories` table can grow very large. We need to delete entries older than 7 days reliably without impacting server performance.
+
+### The Solution: Offloaded Background Job
+
+**Approach: Database-native scheduled job using `pg-boss` (or equivalent)**
+
+The cleanup is handled as an **asynchronous background job**, completely decoupled from the web server request cycle.
+
+#### Why `pg-boss`?
+- Uses PostgreSQL as its own queue — no extra infrastructure (no Redis, no separate worker service needed)
+- Jobs are persisted and survive server restarts
+- Supports cron-style scheduling
+- Transactional — job state changes are ACID-safe
+
+#### Job Definition
+
+```js
+// Scheduled once on server startup
+boss.schedule('cleanup-note-history', '0 2 * * *', {}); 
+// Runs every day at 2:00 AM UTC
+
+boss.work('cleanup-note-history', async () => {
+  await db.query(`
+    DELETE FROM note_histories
+    WHERE changed_at < NOW() - INTERVAL '7 days'
+  `);
+});
+```
+
+#### Why this doesn't stress the server:
+1. **Runs at off-peak hours** — scheduled at 2 AM UTC when traffic is lowest
+2. **Async / non-blocking** — runs in a separate worker process, not in the HTTP request thread
+3. **Single DELETE with index** — `changed_at` is indexed, so the DELETE is fast and doesn't do a full table scan
+4. **Batched deletion (optional for very large tables):**
+
+```js
+// Delete in chunks of 10,000 to avoid long lock holds
+async function cleanupInBatches() {
+  let deleted = 0;
+  do {
+    const result = await db.query(`
+      DELETE FROM note_histories
+      WHERE id IN (
+        SELECT id FROM note_histories
+        WHERE changed_at < NOW() - INTERVAL '7 days'
+        LIMIT 10000
+      )
+    `);
+    deleted = result.rowCount;
+    await sleep(500); // Brief pause between batches
+  } while (deleted > 0);
+}
+```
+
+5. **PostgreSQL autovacuum** will reclaim space after deletion automatically
+
+#### Alternative: PostgreSQL Native Partitioning
+For extremely high-volume history, partition the `note_histories` table by week. Dropping an old partition is near-instant and zero-cost vs. row-level DELETEs.
+
+```sql
+-- Partition by changed_at (weekly)
+CREATE TABLE note_histories (...)
+PARTITION BY RANGE (changed_at);
+
+-- Drop old partitions instead of DELETE
+DROP TABLE note_histories_week_2024_01_01; -- instant
+```
+
+**`[Explain which approach you chose and why]`**
+
+---
+
+## Large Data Seeder
+
+The seeder populates:
+- ~1,000 workspaces (spread across ~50 fake companies, ~20 workspaces each)
+- ~500,000 notes (500 per workspace on average)
+- Realistic titles, content (lorem + tech/business vocabulary mix)
+- Random tags (5–15 unique tags per note from a pool of ~100 tags)
+- Random vote distributions on public notes
+- History entries (2–5 per note)
+- Mix of draft/published, public/private
+
+**Run seeder:**
+```bash
+npm run seed
+# or
+node scripts/seed.js
+```
+
+**Performance considerations for seeding:**
+- Uses `COPY` or bulk `INSERT ... VALUES` with batches of 1,000 rows — much faster than individual inserts
+- Disables indexes during seed, re-enables after (for large tables)
+- Runs in a transaction per batch
+
+`[Explain estimated seed time and how you optimized it]`
+
+---
+
+## Security Considerations
+
+| Concern | Approach |
+|---|---|
+| Authentication | JWT with short expiry (15m access + refresh token) |
+| Authorization | Every query scoped to `company_id` from verified JWT |
+| SQL Injection | Parameterized queries only — no string concatenation |
+| Rate Limiting | Redis-based rate limiting on vote endpoint (prevent vote stuffing) |
+| Password Storage | bcrypt with cost factor ≥ 12 |
+| HTTPS | Enforced in production via reverse proxy (Nginx / Caddy) |
+| Tenant Isolation | `company_id` enforced in every service-layer query, not just routes |
+| Input Validation | Zod / Joi schema validation on all request bodies |
+| CORS | Strict origin whitelist |
+| Secrets | Env vars only — never hardcoded |
+
+---
+
+## Performance & Scalability
+
+### Database Indexes (summary)
+
+```sql
+-- Note search
+CREATE INDEX idx_notes_title_trgm ON notes USING GIN (title gin_trgm_ops);
+
+-- Tenant-scoped workspace queries
+CREATE INDEX idx_notes_company_workspace ON notes (company_id, workspace_id);
+
+-- Public directory sorted listings
+CREATE INDEX idx_notes_public_created ON notes (type, status, created_at DESC)
+  WHERE type = 'public' AND status = 'published';
+
+-- History cleanup
+CREATE INDEX idx_note_histories_changed_at ON note_histories (changed_at);
+
+-- Vote aggregation
+CREATE INDEX idx_votes_note ON note_votes (note_id, vote_type);
+```
+
+### Caching Strategy
+
+- Public note listing (top page of public directory) cached in Redis with 60s TTL
+- Cache invalidated on new public note published or vote change
+- `[Describe cache key structure]`
+
+### Pagination
+
+- Public directory uses **cursor-based pagination** (keyset pagination on `created_at + id`) to avoid OFFSET performance degradation at large page numbers
+- Private workspace note list uses offset pagination (smaller dataset, acceptable)
+
+### Scalability Path
+
+| Scale Trigger | Action |
+|---|---|
+| DB reads bottleneck | Add read replica, route reads there |
+| Vote table too hot | Use Redis counter + async DB sync |
+| History table huge | Switch to range partitioning by week |
+| Search too slow | Migrate to Elasticsearch / Typesense |
+| 10M+ notes | Horizontal DB sharding by `company_id` |
+
+---
+
+## UI Pages & Flows
+
+### Page Map
+
+```
+/login                    — Login page
+/register                 — Company registration
+/dashboard                — Workspace list (private, owner only)
+/workspaces/:id/notes     — Note list in workspace (search by title)
+/workspaces/:id/notes/new — Create note
+/notes/:id/edit           — Edit note (with draft indicator)
+/notes/:id/history        — History list + restore
+/public                   — Public notes directory (search, sort, vote)
+/public/:id               — Single public note view
+```
+
+### Key UI Behaviors
+
+- **Draft indicator:** Orange "DRAFT" badge shown on unpublished notes in workspace view and editor
+- **History view:** Timeline list of previous versions; each entry shows changed timestamp, changed by, and a "Restore" button
+- **Public directory sort:** Dropdown — Newest / Oldest / Most Upvoted / Most Downvoted
+- **Search:** Debounced title search input (300ms delay) on both private list and public directory
+- **Voting:** Upvote/downvote buttons on public note cards; user's current vote is highlighted; one vote per note
 
 ---
 
 ## Tech Stack
 
-| | |
-|---|---|
-| **Express + TypeScript** | HTTP server and middleware pipeline with static typing |
-| **MongoDB Atlas (Free Tier)** | Cloud-hosted document database |
-| **Mongoose** | Schema definition, validation, and query interface |
-| **Zod** | Runtime request validation with TypeScript type inference |
-| **bcrypt** | Password hashing |
-| **jsonwebtoken** | JWT signing and verification |
-| **Multer** | Multipart file handling in memory |
-| **Cloudinary** | Image storage and CDN delivery |
-| **pino** | Structured JSON logger |
-| **express-rate-limit** | Request throttling |
-| **helmet + cors** | Security headers and origin policy |
-
----
-
-## Data Models
-
-### User
-
-Straightforward — stores the fields required by the task: `firstName`, `lastName`, `email`, `passwordHash`, and `avatar`. The `passwordHash` field is marked `select: false` so Mongoose excludes it from every query result by default. It cannot be accidentally returned to a client.
-
-### Post
-
-`author` is stored as an `ObjectId` reference to the User collection rather than embedding user data. Embedding would mean every post update that touches author data (name change, avatar change) requires updating every post document. A reference keeps the data in one place and a `populate` call resolves it at read time.
-
-Post carries denormalized `likeCount` and `commentCount` fields. Counting from the Like and Comment collections on every feed request is expensive at scale. These counters are maintained with atomic `$inc` operations to stay consistent under concurrent writes.
-
-### Comment & Reply
-
-Comments and replies share the same collection, distinguished by a single field: `parentId`. A top-level comment has `parentId: null`. A reply has `parentId` set to the `_id` of its parent comment. Two separate collections (e.g. `comments` and `replies`) were considered and rejected — they would require two sets of routes, controllers, service functions, and indexes for data that is structurally identical. One collection, one schema, one index strategy.
-
-**Nesting is capped at one level**, enforced in the service layer. When `createReply` is called, the parent comment is fetched and checked: if `parent.parentId !== null`, the request is rejected with a 400. Replies cannot have replies. This is a product decision as much as a technical one — threaded depth beyond one level adds UI complexity and moderation burden with little benefit at this scale.
-
-**Fetch strategy** — comments and replies are fetched through separate endpoints and separate queries. The comments endpoint (`GET /posts/:id/comments`) queries `{ postId, parentId: null }` to return only top-level comments. Replies for a given comment are loaded on demand via `GET /comments/:id/replies`, querying `{ parentId: commentId }`. This lazy loading means a post with 200 comments does not also load all reply threads — only the replies the user expands are fetched.
-
-Both queries use cursor-based pagination on `_id` and sort ascending (`{ _id: 1 }`). Comments in a thread are read oldest-first, top to bottom — the opposite of the feed. The cursor is the last seen `_id`; subsequent pages use `{ _id: { $gt: cursor } }`.
-
-**Index strategy** — two compound indexes serve the two query patterns:
-
-| Index | Query it serves |
-|---|---|
-| `{ postId, parentId, createdAt }` | Top-level comments for a post — filters by `postId` and `parentId: null` |
-| `{ parentId, createdAt }` | Replies for a comment — filters by `parentId` |
-
-Both include `createdAt` to support future sort-by-date queries without a collection scan.
-
-**`replyCount`** is denormalized on the parent comment document, maintained with atomic `$inc` on reply create and delete. The same reasoning applies as `commentCount` on Post — counting reply documents on every request is unnecessary work.
-
-**`likedByMe`** is resolved for the page in one query, using the same `$in` set approach as the feed.
-
-**Cascade delete** — deleting a top-level comment must also remove its replies and all associated likes. `deleteComment` runs four operations in parallel via `Promise.all`: delete the comment, delete all its replies (`Comment.deleteMany({ parentId: id })`), delete all likes on the comment and its replies (`Like.deleteMany({ $or: [{ targetId: id }, { parentCommentId: id }] })`), and decrement `commentCount` on the post. The `parentCommentId` field on Like documents makes the like cleanup a single query — no reply IDs need to be loaded into memory first.
-
-**Separate delete endpoints** — a top-level comment and a reply share the same collection but are intentionally deleted through different endpoints. The service enforces this at the boundary: `deleteComment` rejects documents where `parentId !== null`, and `deleteReply` rejects documents where `parentId === null`. This prevents accidental cross-endpoint deletions and keeps the cleanup logic for each case simple and correct.
-
-### Like
-
-The first instinct is to embed likes as an array on the post: `likes: [userId]`. This breaks at scale. The array is unbounded — a post with millions of likes grows the document indefinitely, and MongoDB enforces a 16MB document size limit. Scanning the array for `likedByMe` is O(n). A separate Like collection solves both: a unique compound index on `{ userId, targetId, targetType }` prevents duplicate likes at the database level, and the lookup is O(log n).
-
-The Like schema carries two denormalized fields beyond the basic reference:
-
-**`targetType: 'post' | 'comment'`** — makes the schema polymorphic. Post likes, comment likes, and reply likes all live in one collection. Adding a new likeable entity in the future is a schema change, not a new collection.
-
-**`postId`** — when a post is deleted, its comments, replies, and all their associated likes must be cleaned up. Without `postId` on Like, getting the comment like IDs requires loading all comment IDs into memory first: `Comment.find({ postId }).distinct('_id')`. With `postId` denormalized on Like, the entire cleanup is a single query: `Like.deleteMany({ postId })`. No IDs in memory.
-
-**`parentCommentId`** — the same problem exists when a top-level comment is deleted. Its replies exist in the Comment collection, and their likes exist in the Like collection. `parentCommentId` on reply-like documents enables: `Like.deleteMany({ $or: [{ targetId: commentId }, { parentCommentId: commentId }] })` — one query, no reply IDs loaded.
-
----
-
-## Application Architecture
-
-The codebase follows a **layered architecture**: every request moves through routes → controller → service, with no repository layer.
-
-```
-Routes       Define the HTTP method, path, and middleware chain
-Controllers  Read from req, call the service, write to res — nothing else
-Services     All business logic, validation rules, and database queries
-```
-
-A repository layer (an abstraction over the database client) is absent intentionally. Mongoose models already provide that abstraction — `Post.findById()`, `Post.create()`, `Post.updateOne()` are a clean enough interface. Adding a repository on top would mean writing wrapper functions that do nothing except call Mongoose, which adds indirection without value at this scale.
-
-The boundary that matters here is the controller/service split. Services have no knowledge of HTTP — they receive plain arguments and throw `ApiError` on failure. This means business logic is fully testable without spinning up an HTTP server.
-
----
-
-## Request Flow
-
-A request to `POST /api/v1/posts` passes through the following layers in order:
-
-```
-1. Request logger     Starts a timer, attaches a finish listener to log method/path/status/ms
-2. helmet             Sets security response headers
-3. cors               Validates the request origin against FRONTEND_URL
-4. express.json       Parses the request body (1MB limit)
-5. cookieParser       Parses the Cookie header into req.cookies
-6. apiRateLimit       Global guard — 300 req/min per IP
-7. createPostLimit    Route-specific guard — 30 posts/hour per IP
-8. requireAuth        Verifies JWT from cookie, loads user into req.currentUser
-9. upload.single      Validates and buffers the image in memory (MIME + size check)
-10. validate(schema)  Runs req.body through the Zod schema, strips unknown fields
-11. Controller        Reads req, calls PostService.createPost, writes res
-12. Service           Uploads image to Cloudinary, creates Post document, returns result
-13. errorHandler      Catches anything thrown — ApiError gets its status code, everything else gets 500
-```
-
----
-
-## Core Modules
-
-### Rate Limiting
-
-Five separate limits are applied at different scopes:
-
-| Limit | Window | Route |
+| Layer | Technology | Reason |
 |---|---|---|
-| 300 requests | 1 min | All `/api/` routes |
-| 10 attempts | 15 min | Login |
-| 5 attempts | 1 hour | Register |
-| 30 posts | 1 hour | Create post |
-| 60 comments | 1 hour | Create comment/reply |
-
-The global limit guards against DoS. The auth limits guard against brute force and account creation spam. Route-specific limits are more permissive than auth but still prevent abuse. `standardHeaders: true` exposes remaining quota in response headers so the frontend can act on it.
-
-### Zod Validation
-
-Every request body passes through a Zod schema before reaching the controller. On failure the middleware responds immediately with the field name and message — the controller is never reached. On success `req.body` is replaced with the parsed output, which strips any fields not defined in the schema. This prevents mass assignment: a request body containing `{ "isAdmin": true }` has that field removed before any service sees it.
-
-### Global Error Handler
-
-A single `errorHandler` middleware sits at the bottom of the Express stack. Services throw `ApiError` with an explicit status code and optional field name. The handler serializes it directly. Any error that is not an `ApiError` gets logged in full server-side and returns a generic 500 to the client — stack traces, file paths, and query details never leave the server.
-
-### Logger
-
-`pino` outputs structured JSON in production, readable colored output in development via `pino-pretty`. The request logger middleware measures each request's duration and logs `method + path` as the message with `{ status, ms }` as metadata. The log level is driven by the response status code — `>=500` logs as error, `>=400` as warn, the rest as info. This makes it straightforward to set up alerts on error-level logs in any log aggregation platform.
-
-### Feed — Initial Fetch
-
-The feed query returns public posts plus the current user's own private posts, sorted by `_id` descending (newest first). Pagination uses the last seen `_id` as a cursor rather than a page offset. Offset pagination requires skipping N documents on every deeper page — expensive and incorrect when new posts arrive between page loads. Cursor pagination is a range query on an indexed field, always O(log n), and stable under concurrent writes.
-
-`likedByMe` is resolved for the entire page in one query. All post IDs are sent to the Like collection in a single `$in` query, the results are placed in a Set, and membership is checked in O(1) per post. This keeps the feed fetch at a constant two database queries regardless of page size.
-
-### Image Upload
-
-Post images are handled through a two-step pipeline: Multer receives the file, Cloudinary stores it.
-
-```
-multipart/form-data → Multer (memory) → uploadImage(buffer) → Cloudinary → URL stored on Post
-```
-
-Multer is configured with `memoryStorage` — the file never touches disk. It lives as a `Buffer` in RAM for the duration of the request and is passed directly to Cloudinary's upload stream. Disk storage was ruled out because in a multi-server deployment a file written to one server's disk is invisible to every other instance behind the load balancer. Memory storage has no this problem and requires no cleanup.
-
-Validation happens at the Multer layer before the file reaches any business logic — MIME type must be `image/jpeg`, `image/png`, or `image/webp`, and size is capped at 5MB. A video file or an oversized image is rejected at the HTTP layer immediately.
-
-Cloudinary was chosen to avoid building CDN infrastructure. It handles storage, delivery, and format optimization. The backend stores only the returned URL on the Post document — it has no knowledge of where or how the file is physically stored.
-
-### Like Toggle
-
-`POST /:id/like` is a toggle — one endpoint handles both like and unlike. When called, it checks for an existing Like document. If found, it deletes it and decrements the counter. If not, it creates one and increments. The counter update uses `$inc` which is atomic at the document level — concurrent like requests cannot produce an incorrect final count. The response always returns `{ liked: boolean, likeCount: number }` so the frontend can update state without a follow-up fetch.
+| Backend | `[Node.js + Express / Fastify / Next.js API]` | `[Your reason]` |
+| Database | PostgreSQL | Relational integrity, JSONB, full-text search, RLS |
+| Cache | Redis | Fast read cache, rate limiting |
+| Job Queue | `[pg-boss / BullMQ / node-cron]` | `[Your reason]` |
+| ORM / Query | `[Prisma / Drizzle / Knex / raw pg]` | `[Your reason]` |
+| Auth | JWT + bcrypt | Stateless, scalable |
+| Frontend | `[Next.js / React / Plain HTML]` | `[Your reason]` |
+| Validation | `[Zod / Joi]` | Schema-first validation |
+| Seeder | Custom script | Bulk insert with realistic data |
 
 ---
 
-## Running the Project
+## Project Structure
 
-**Prerequisites:** Node.js 18+, MongoDB Atlas cluster, Cloudinary account.
-
-```bash
-npm install
-cp .env.example .env   # fill in your values
-npm run dev            # starts with hot reload on port 5000
+```
+/
+├── src/
+│   ├── config/           # DB, Redis, env config
+│   ├── middleware/        # Auth, rate limit, error handler
+│   ├── modules/
+│   │   ├── auth/          # Login, register, JWT
+│   │   ├── workspaces/    # Workspace CRUD
+│   │   ├── notes/         # Note CRUD, publish, draft
+│   │   ├── history/       # History list, restore
+│   │   ├── votes/         # Vote endpoint
+│   │   └── public/        # Public directory
+│   ├── jobs/              # Background job definitions
+│   │   └── cleanupHistory.js
+│   ├── db/
+│   │   ├── migrations/    # SQL migration files
+│   │   └── schema.sql     # Full schema reference
+│   └── scripts/
+│       └── seed.js        # Large data seeder
+├── frontend/              # UI (if separate)
+│   ├── pages/
+│   └── components/
+├── .env.example
+├── docker-compose.yml
+└── README.md
 ```
 
+---
+
+## Getting Started
+
+### Prerequisites
+- Node.js ≥ 18
+- PostgreSQL ≥ 15
+- Redis ≥ 7
+
+### Installation
+
 ```bash
-npm run typecheck      # type check without emitting
-npm run build          # compile to dist/
-node dist/server.js    # run production build
+git clone [repo-url]
+cd workspace-notes
+npm install
+cp .env.example .env
+# Edit .env with your DB credentials
+```
+
+### Database Setup
+
+```bash
+# Run migrations
+npm run migrate
+
+# (Optional) Seed with large dataset
+npm run seed
+```
+
+### Run Development Server
+
+```bash
+npm run dev
+```
+
+### Run Background Job Worker
+
+```bash
+npm run worker
+# This starts the pg-boss / BullMQ worker that handles scheduled cleanup
 ```
 
 ---
 
 ## Environment Variables
 
-| Variable | Description |
-|---|---|
-| `PORT` | Server port (default: 5000) |
-| `NODE_ENV` | `development` or `production` |
-| `FRONTEND_URL` | Allowed CORS origin |
-| `MONGODB_URI` | MongoDB Atlas connection string |
-| `JWT_SECRET` | Minimum 32-character signing secret |
-| `JWT_EXPIRES_IN` | Token lifetime — e.g. `7d` |
-| `CLOUDINARY_CLOUD_NAME` | Cloudinary cloud name |
-| `CLOUDINARY_API_KEY` | Cloudinary API key |
-| `CLOUDINARY_API_SECRET` | Cloudinary API secret |
-| `LOG_LEVEL` | pino log level — e.g. `info` |
+```env
+# Database
+DATABASE_URL=postgresql://user:password@localhost:5432/workspace_notes
 
-See `.env.example` for the full template.
+# Redis
+REDIS_URL=redis://localhost:6379
+
+# Auth
+JWT_SECRET=your-very-long-random-secret
+JWT_EXPIRY=15m
+REFRESH_TOKEN_SECRET=another-long-secret
+REFRESH_TOKEN_EXPIRY=7d
+
+# App
+PORT=3000
+NODE_ENV=development
+
+# Rate Limiting
+VOTE_RATE_LIMIT_WINDOW_MS=60000
+VOTE_RATE_LIMIT_MAX=10
+```
+
+---
+
+## Known Limitations & Future Work
+
+| Item | Status | Notes |
+|---|---|---|
+| Full implementation | Scoped to design | Time constraint — full implementation would require ~3-4 days |
+| Email verification | Not implemented | Would add on next iteration |
+| Real-time collaboration | Not in scope | Would use WebSockets / CRDTs |
+| File attachments in notes | Not in scope | Would use S3 + signed URLs |
+| Admin panel | Not in scope | For managing companies/users |
+| Full-text content search | Title only | Content search would need Elasticsearch |
+| Anonymous voting | Not implemented | Would use browser fingerprinting |
+
+---
+
+## Author
+
+`[Your Name]`  
+Built as part of a Full-Stack Developer assessment task  
+Date: `[Date]`
